@@ -972,6 +972,18 @@
         },
         "index_scans": {
           "type": "integer"
+        },
+        "hot_partition": {
+          "type": "string"
+        },
+        "hot_scans": {
+          "type": "integer"
+        },
+        "big_partition": {
+          "type": "string"
+        },
+        "big_rows": {
+          "type": "integer"
         }
       },
       "additionalProperties": false,
