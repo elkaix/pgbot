@@ -298,12 +298,16 @@ func RunWaitStudy(ctx context.Context, t *conn.Target, caps conn.Capabilities, o
 	// waits were the device (ms per read) or cache misses served by the kernel.
 	var ioA any
 	if caps.HasStatIO() {
-		ioA, _ = iostatsCollector{}.Sample(ctx, t, caps)
+		ioA, _ = iostatsCollector{}.Sample(ctx, t, caps) // best effort: no opening sample, no IO verdict
 	}
 	ioStart := time.Now()
 	study := runWaitStudy(ctx, t, caps, o)
 	if ioA != nil {
-		if ioB, err := (iostatsCollector{}).Sample(ctx, t, caps); err == nil {
+		// Ctrl+C mid-window still reports what was gathered, so the closing
+		// sample must outlive the caller's cancellation — bounded by its own budget.
+		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ashPollBudget)
+		defer cancel()
+		if ioB, err := (iostatsCollector{}).Sample(closeCtx, t, caps); err == nil {
 			var scratch model.Context
 			iostatsCollector{}.Assemble(&scratch, caps, sampled{A: ioA, B: ioB}, time.Since(ioStart), Options{})
 			if scratch.IOStats != nil && scratch.IOStats.Exactness == model.ExactnessSampled {

@@ -93,11 +93,9 @@ const (
 	// io_read_latency_high: mean physical read latency (pg_stat_io.read_time /
 	// reads over the window) at or above this is storage-bound, not cache-bound.
 	// 5 ms is the boundary between "kernel page cache / local NVMe" and "waiting
-	// on a network volume"; the floor on reads keeps a handful of cold reads
-	// from producing a meaningless mean.
+	// on a network volume". model.IOStats.JudgedReadLatency owns the read floor.
 	ioReadLatencyWarnMS = 5.0
 	ioReadLatencyCritMS = 20.0
-	ioReadLatencyMinOps = 500
 	// poolSizing: the cumulative window must be at least this old before the
 	// average-concurrency estimate is trustworthy.
 	poolSizingMinWindowS = 3600
@@ -809,6 +807,12 @@ func autovacuumTableTuning(c *model.Context, add func(model.Finding)) {
 	}
 	gThresh := settingFloat(c, "autovacuum_vacuum_threshold", 50)
 	gScale := settingFloat(c, "autovacuum_vacuum_scale_factor", 0.2)
+	// PG18 caps the trigger at autovacuum_vacuum_max_threshold (default 100M;
+	// -1 disables). Absent below PG18, so no cap.
+	gMax := settingFloat(c, "autovacuum_vacuum_max_threshold", -1)
+	if gScale < avTuneMinScale {
+		return // the global trigger is already fine-grained
+	}
 	var ev, objs []string
 	var worstTrigger int64
 	for _, t := range c.Tables.Top {
@@ -818,14 +822,14 @@ func autovacuumTableTuning(c *model.Context, add func(model.Finding)) {
 		if t.DeadTuples == 0 && t.Updates == 0 {
 			continue // append-only or idle: the vacuum trigger is not the constraint
 		}
-		if gScale < avTuneMinScale {
-			continue
-		}
 		th := gThresh
 		if t.VacuumThresholdOverride != nil {
 			th = *t.VacuumThresholdOverride
 		}
 		trigger := int64(th + gScale*float64(t.LiveTuples))
+		if gMax >= 0 && trigger > int64(gMax) {
+			trigger = int64(gMax)
+		}
 		suggested := int64(avTuneSuggestedThres + avTuneSuggestedScale*float64(t.LiveTuples))
 		if trigger > worstTrigger {
 			worstTrigger = trigger
@@ -1253,12 +1257,12 @@ func waitFindings(c *model.Context, add func(model.Finding)) {
 	if io := share("IO"); io > waitIOBoundShare {
 		ev := []string{ioEvidence(w)}
 		rem := "Add RAM/shared_buffers or better indexes; check for large scans returning few rows."
-		if st := c.IOStats; st != nil && st.Exactness == model.ExactnessSampled && st.TrackIOTiming && st.ReadLatencyMS != nil && st.ReadsInWindow >= ioReadLatencyMinOps {
-			if *st.ReadLatencyMS >= 1 {
-				ev = append(ev, fmt.Sprintf("pg_stat_io: %d physical reads at %.2f ms each — the device served them, not the page cache", st.ReadsInWindow, *st.ReadLatencyMS))
+		if lat, ok := c.IOStats.JudgedReadLatency(); ok {
+			if lat >= model.IODeviceReadMS {
+				ev = append(ev, fmt.Sprintf("pg_stat_io: %d physical reads at %.2f ms each — the device served them, not the page cache", c.IOStats.ReadsInWindow, lat))
 				rem = "Reads wait on the device: cut blocks read first (top queries by shared_blks_read, indexes, bloat), then fit the working set in shared_buffers, then effective_io_concurrency / io_method / volume class — re-measure read latency after each."
 			} else {
-				ev = append(ev, fmt.Sprintf("pg_stat_io: %d physical reads at %.2f ms each — served from the kernel page cache; the cost is volume, not device latency", st.ReadsInWindow, *st.ReadLatencyMS))
+				ev = append(ev, fmt.Sprintf("pg_stat_io: %d physical reads at %.2f ms each — served from the kernel page cache; the cost is volume, not device latency", c.IOStats.ReadsInWindow, lat))
 				rem = "Reads are cheap but many: find the query reading the most blocks (pgbot queries) and give it an index (pgbot advise) — more cache or faster storage would not change this."
 			}
 		}
@@ -2351,21 +2355,25 @@ func configSanity(c *model.Context, add func(model.Finding)) {
 				if hmm < 1 {
 					hmm = 1
 				}
-				sb, _ := parseMemBytes(settingParam(c, "shared_buffers"))
+				sb, sbOK := parseMemBytes(settingParam(c, "shared_buffers"))
 				perBackend := int64(float64(wm) * hmm)
 				envelope := sb + perBackend*int64(mc)
 				if envelope > ecs {
+					var ev []string
+					if sbOK {
+						ev = append(ev, "shared_buffers "+humanBytes(sb))
+					}
+					ev = append(ev,
+						fmt.Sprintf("work_mem %s × hash_mem_multiplier %g = %s per hash operation", humanBytes(wm), hmm, humanBytes(perBackend)),
+						fmt.Sprintf("× max_connections %d = %s", mc, humanBytes(perBackend*int64(mc))),
+						"effective_cache_size "+humanBytes(ecs),
+					)
 					title := fmt.Sprintf("work_mem × %g × max_connections + shared_buffers (%s) exceeds effective_cache_size (%s)", hmm, humanBytes(envelope), humanBytes(ecs))
 					add(model.Finding{
 						ID: "work_mem_overcommit", Object: "setting:work_mem", Severity: model.SeverityWarn,
-						Title:  title,
-						Detail: "work_mem is allocated per sort/hash operation and hash operations get work_mem × hash_mem_multiplier, so one burst of concurrent memory-hungry queries can reach shared_buffers + work_mem × hash_mem_multiplier × max_connections. When that exceeds the memory you've told the planner exists, the host runs out of page cache and then of RAM — the OOM killer takes a backend or the postmaster.",
-						Evidence: []string{
-							"shared_buffers " + humanBytes(sb),
-							fmt.Sprintf("work_mem %s × hash_mem_multiplier %g = %s per hash operation", humanBytes(wm), hmm, humanBytes(perBackend)),
-							fmt.Sprintf("× max_connections %d = %s", mc, humanBytes(perBackend*int64(mc))),
-							"effective_cache_size " + humanBytes(ecs),
-						},
+						Title:       title,
+						Detail:      "work_mem is allocated per sort/hash operation and hash operations get work_mem × hash_mem_multiplier, so one burst of concurrent memory-hungry queries can reach shared_buffers + work_mem × hash_mem_multiplier × max_connections. When that exceeds the memory you've told the planner exists, the host runs out of page cache and then of RAM — the OOM killer takes a backend or the postmaster.",
+						Evidence:    ev,
 						Remediation: "Lower work_mem or hash_mem_multiplier, cap real concurrency with a pooler so max_connections can drop, or raise host memory. Raise work_mem per-session (SET work_mem) only for the queries that spill.",
 						Impact:      impact(model.DimRisk, 45, humanBytes(envelope)+" peak envelope", "shared_buffers + work_mem × hash_mem_multiplier × max_connections vs effective_cache_size"),
 						Confidence:  0.55,
@@ -2395,7 +2403,7 @@ func configSanity(c *model.Context, add func(model.Finding)) {
 			ID: "slot_wal_keep_unbounded", Object: "setting:max_slot_wal_keep_size", Severity: model.SeverityInfo,
 			Title:       fmt.Sprintf("max_slot_wal_keep_size = -1 with %d replication slot(s) — WAL retention is unbounded", n),
 			Detail:      "A replication slot pins WAL from its restart point until its consumer catches up. With max_slot_wal_keep_size at the default (-1) there is no ceiling: a standby that is down, a stalled logical subscriber, or a forgotten slot retains WAL until pg_wal fills the disk and the primary stops. A bound trades that for a re-seed of the consumer — which is usually the better failure.",
-			Remediation: "Set max_slot_wal_keep_size to the WAL volume you can afford to keep (e.g. '50GB'; a reload). Size it above the longest consumer outage you want to survive, and alert on pg_replication_slots.wal_status = 'unreserved'. On PG17+ idle_replication_slot_timeout invalidates slots nobody has used.",
+			Remediation: "Set max_slot_wal_keep_size to the WAL volume you can afford to keep (e.g. '50GB'; a reload). Size it above the longest consumer outage you want to survive, and alert on pg_replication_slots.wal_status = 'unreserved'. On PG18+ idle_replication_slot_timeout invalidates slots nobody has used.",
 			Impact:      impact(model.DimRisk, 25, fmt.Sprintf("%d slot(s), no retention cap", n), "max_slot_wal_keep_size vs pg_replication_slots"),
 			Confidence:  0.8,
 		})
@@ -2484,13 +2492,10 @@ func ioTimingOff(c *model.Context, add func(model.Finding)) {
 // Requires track_io_timing (otherwise read_time is 0 and there is no latency).
 func ioReadLatencyHigh(c *model.Context, add func(model.Finding)) {
 	io := c.IOStats
-	if io == nil || io.Exactness != model.ExactnessSampled || !io.TrackIOTiming || io.ReadLatencyMS == nil {
+	lat, ok := io.JudgedReadLatency()
+	if !ok || lat < ioReadLatencyWarnMS {
 		return
 	}
-	if io.ReadsInWindow < ioReadLatencyMinOps || *io.ReadLatencyMS < ioReadLatencyWarnMS {
-		return
-	}
-	lat := *io.ReadLatencyMS
 	sev, score := model.SeverityWarn, math.Min(70, 30+lat*2)
 	if lat >= ioReadLatencyCritMS {
 		sev, score = model.SeverityCritical, 85

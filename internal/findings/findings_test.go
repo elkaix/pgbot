@@ -666,6 +666,14 @@ func TestAutovacuumTableTuning(t *testing.T) {
 			t.Errorf("%s must not fire", name)
 		}
 	}
+	// PG18 caps the trigger at autovacuum_vacuum_max_threshold: 1B rows at 20%
+	// would be 200M, but autovacuum starts at the 100M cap.
+	huge := big
+	huge.LiveTuples = 1_000_000_000
+	pg18 := &model.Context{Tables: &model.Tables{Top: []model.TableStat{huge}}, Settings: &model.Settings{Params: map[string]string{"autovacuum_vacuum_max_threshold": "100000000"}}}
+	if f := has(Compute(pg18), "autovacuum_table_tuning"); f == nil || !contains(f.Evidence[0], "waits for 100.0M dead rows") {
+		t.Errorf("PG18 trigger must be capped at autovacuum_vacuum_max_threshold, got %+v", f)
+	}
 	// Global scale already lowered → silent.
 	low := &model.Context{Tables: c.Tables, Settings: &model.Settings{Params: map[string]string{"autovacuum_vacuum_scale_factor": "0.05"}}}
 	if has(Compute(low), "autovacuum_table_tuning") != nil {

@@ -23,8 +23,8 @@ type LiveReport struct {
 }
 
 // ioVerdict turns the window's pg_stat_io reading into one evidence line and a
-// storage-bound flag. Needs track_io_timing and enough reads for the mean to
-// hold (ioVerdictMinReads); otherwise it says what is missing.
+// storage-bound flag. model.IOStats.JudgedReadLatency decides whether the mean
+// can be trusted; otherwise the line says what is missing.
 func ioVerdict(io *model.IOStats) (line string, storage bool) {
 	if io == nil || io.Exactness != model.ExactnessSampled {
 		return "", false
@@ -32,11 +32,14 @@ func ioVerdict(io *model.IOStats) (line string, storage bool) {
 	if !io.TrackIOTiming {
 		return "pg_stat_io: track_io_timing is off, so per-read latency is unknown — turn it on (a reload) to tell device waits from cache misses.", false
 	}
-	if io.ReadLatencyMS == nil || io.ReadsInWindow < ioVerdictMinReads {
-		return fmt.Sprintf("pg_stat_io: only %d physical reads in the window — too few to judge storage latency.", io.ReadsInWindow), false
+	lat, ok := io.JudgedReadLatency()
+	if !ok {
+		if io.ReadsInWindow < model.IOMinReadsForLatency {
+			return fmt.Sprintf("pg_stat_io: only %d physical reads in the window — too few to judge storage latency.", io.ReadsInWindow), false
+		}
+		return "pg_stat_io: read timing went backwards during the window (a stats reset) — latency unknown.", false
 	}
-	lat := *io.ReadLatencyMS
-	if lat >= ioVerdictStorageMS {
+	if lat >= model.IODeviceReadMS {
 		return fmt.Sprintf("pg_stat_io: %d physical reads averaged %.2f ms each — the device (or volume latency floor), not the page cache, served them.", io.ReadsInWindow, lat), true
 	}
 	return fmt.Sprintf("pg_stat_io: %d physical reads averaged %.2f ms each — served from the kernel page cache; the cost is block volume, not device latency.", io.ReadsInWindow, lat), false
@@ -57,8 +60,6 @@ const (
 	liveAASFloor       = 0.5
 	liveLockShareBar   = 0.40
 	liveIOShareBar     = 0.40
-	ioVerdictMinReads  = 500 // reads in the window before a mean latency means anything
-	ioVerdictStorageMS = 1.0 // ≥ 1 ms per read is a device, not the page cache
 	liveClientShareBar = 0.50
 	liveCPUShareBar    = 0.60
 	histMinSamples     = 100

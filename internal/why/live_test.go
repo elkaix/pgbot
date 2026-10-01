@@ -159,6 +159,8 @@ func TestIOVerdict(t *testing.T) {
 		{"too few reads", &model.IOStats{Section: sampled, TrackIOTiming: true, ReadLatencyMS: f(9), ReadsInWindow: 12}, "too few", false},
 		{"device", &model.IOStats{Section: sampled, TrackIOTiming: true, ReadLatencyMS: f(3.5), ReadsInWindow: 2000}, "the device", true},
 		{"page cache", &model.IOStats{Section: sampled, TrackIOTiming: true, ReadLatencyMS: f(0.03), ReadsInWindow: 2000}, "kernel page cache", false},
+		{"boundary", &model.IOStats{Section: sampled, TrackIOTiming: true, ReadLatencyMS: f(model.IODeviceReadMS), ReadsInWindow: model.IOMinReadsForLatency}, "the device", true},
+		{"timing reset", &model.IOStats{Section: sampled, TrackIOTiming: true, ReadsInWindow: 2000}, "stats reset", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

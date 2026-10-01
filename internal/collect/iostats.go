@@ -70,13 +70,17 @@ func (iostatsCollector) Assemble(c *model.Context, caps conn.Capabilities, s sam
 		c.IOStats = &model.IOStats{Section: model.Section{Exactness: model.ExactnessUnavailable, Reason: "zero sample interval"}}
 		return
 	}
-	out := &model.IOStats{Section: model.Section{Exactness: model.ExactnessSampled}, TrackIOTiming: b.ioTiming}
+	// Latency needs timing on at both ends: a mid-window toggle leaves read_time
+	// covering only part of the reads and understates the mean.
+	timing := a.ioTiming && b.ioTiming
+	out := &model.IOStats{Section: model.Section{Exactness: model.ExactnessSampled}, TrackIOTiming: timing}
 	key := func(r ioStatRow) string { return r.BackendType + "\x00" + r.Object + "\x00" + r.Context }
 	first := map[string]ioStatRow{}
 	for _, r := range a.rows {
 		first[key(r)] = r
 	}
-	var reads, writes, fsyncs int64
+	var allReads, allWrites, allFsyncs int64 // every row, for the rates
+	var reads, writes, fsyncs int64          // data rows only, for the latency means
 	var readT, writeT, fsyncT float64
 	for _, rb := range b.rows {
 		ra, ok := first[key(rb)]
@@ -87,7 +91,7 @@ func (iostatsCollector) Assemble(c *model.Context, caps conn.Capabilities, s sam
 		dw, okW := rate.Delta(ra.Writes, rb.Writes)
 		df, okF := rate.Delta(ra.Fsyncs, rb.Fsyncs)
 		if !okR || !okW || !okF {
-			c.IOStats = &model.IOStats{Section: model.Section{Exactness: model.ExactnessReset, Reason: "pg_stat_io counter reset between samples"}, TrackIOTiming: b.ioTiming}
+			c.IOStats = &model.IOStats{Section: model.Section{Exactness: model.ExactnessReset, Reason: "pg_stat_io counter reset between samples"}, TrackIOTiming: timing}
 			return
 		}
 		if dr == 0 && dw == 0 && df == 0 {
@@ -97,9 +101,19 @@ func (iostatsCollector) Assemble(c *model.Context, caps conn.Capabilities, s sam
 			BackendType: rb.BackendType, Object: rb.Object, Context: rb.Context,
 			ReadsPerSec: round2(float64(dr) / secs), WritesPerSec: round2(float64(dw) / secs), FsyncsPerSec: round2(float64(df) / secs),
 		}
-		if b.ioTiming {
+		// PG18's wal rows are timed by track_wal_io_timing, not track_io_timing:
+		// counted but zero-timed by default, so they stay out of every mean.
+		data := rb.Object != "wal"
+		if timing && data {
 			row.ReadLatencyMS = meanMS(rb.ReadTime-ra.ReadTime, dr)
 			row.WriteLatencyMS = meanMS(rb.WriteTime-ra.WriteTime, dw)
+		}
+		out.Rows = append(out.Rows, row)
+		allReads += dr
+		allWrites += dw
+		allFsyncs += df
+		if !data {
+			continue
 		}
 		reads += dr
 		writes += dw
@@ -107,12 +121,11 @@ func (iostatsCollector) Assemble(c *model.Context, caps conn.Capabilities, s sam
 		readT += rb.ReadTime - ra.ReadTime
 		writeT += rb.WriteTime - ra.WriteTime
 		fsyncT += rb.FsyncTime - ra.FsyncTime
-		out.Rows = append(out.Rows, row)
 	}
-	r, w, f := round2(float64(reads)/secs), round2(float64(writes)/secs), round2(float64(fsyncs)/secs)
+	r, w, f := round2(float64(allReads)/secs), round2(float64(allWrites)/secs), round2(float64(allFsyncs)/secs)
 	out.ReadsPerSec, out.WritesPerSec, out.FsyncsPerSec = &r, &w, &f
 	out.ReadsInWindow = reads
-	if b.ioTiming {
+	if timing {
 		out.ReadLatencyMS = meanMS(readT, reads)
 		out.WriteLatencyMS = meanMS(writeT, writes)
 		out.FsyncLatencyMS = meanMS(fsyncT, fsyncs)

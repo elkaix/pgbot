@@ -56,7 +56,8 @@ WHERE s.n_live_tup >= 1000000
 ORDER BY s.n_live_tup DESC;
 ```
 
-The trigger is `threshold + scale × n_live_tup`.
+The trigger is `threshold + scale × n_live_tup`, capped on PostgreSQL 18+ by
+`autovacuum_vacuum_max_threshold` (default 100M).
 
 ## How to fix it
 

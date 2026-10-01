@@ -47,7 +47,7 @@ SELECT pg_reload_conf();
 
 Size it above the longest consumer outage you intend to survive (WAL rate ×
 hours — `pgbot inspect --full` shows the WAL rate) and below the disk headroom.
-Alert on `wal_status = 'unreserved'` so you act before `lost`. On PostgreSQL 17+
+Alert on `wal_status = 'unreserved'` so you act before `lost`. On PostgreSQL 18+
 `idle_replication_slot_timeout` additionally invalidates slots nobody has used.
 
 ## When to ignore it

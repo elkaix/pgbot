@@ -19,7 +19,8 @@ roots AS (
   SELECT leaf, node AS root FROM climb WHERE NOT relispartition
 ),
 leaves AS (
-  SELECT r.root, s.relid, s.relname, s.n_live_tup,
+  SELECT r.root, s.relname, s.n_live_tup, s.seq_scan,
+         coalesce(s.idx_scan, 0)              AS idx_scan,
          s.seq_scan + coalesce(s.idx_scan, 0) AS scans,
          pg_total_relation_size(s.relid)      AS bytes
   FROM roots r
@@ -40,14 +41,13 @@ SELECT n.nspname                 AS schema,
        count(*)                  AS partitions,
        sum(l.bytes)              AS total_bytes,
        sum(l.n_live_tup)         AS live_tuples,
-       sum(l.scans) - sum(coalesce(s.idx_scan, 0)) AS seq_scans,
-       sum(coalesce(s.idx_scan, 0)) AS index_scans,
+       sum(l.seq_scan)           AS seq_scans,
+       sum(l.idx_scan)           AS index_scans,
        max(hot.hot_partition)    AS hot_partition,
        max(hot.hot_scans)        AS hot_scans,
        max(big.big_partition)    AS big_partition,
        max(big.big_rows)         AS big_rows
 FROM leaves l
-JOIN pg_stat_user_tables s ON s.relid = l.relid
 JOIN pg_class rc     ON rc.oid = l.root
 JOIN pg_namespace n  ON n.oid = rc.relnamespace
 JOIN hot ON hot.root = l.root

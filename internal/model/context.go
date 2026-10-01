@@ -335,7 +335,7 @@ type PartitionRollup struct {
 	LiveTuples int64  `json:"live_tuples"`
 	SeqScans   int64  `json:"seq_scans"`
 	IndexScans int64  `json:"index_scans"`
-	// Skew evidence (1.4.0): the leaf taking the most scans and the leaf holding
+	// Skew evidence (1.6.0): the leaf taking the most scans and the leaf holding
 	// the most rows. Cumulative counters — a newly attached partition looks cold.
 	HotPartition string `json:"hot_partition,omitempty"`
 	HotScans     int64  `json:"hot_scans,omitempty"`
@@ -449,6 +449,24 @@ type IOStats struct {
 	FsyncLatencyMS *float64    `json:"fsync_latency_ms,omitempty"`
 	ReadsInWindow  int64       `json:"reads_in_window"` // the latency's denominator — judge it before trusting the mean
 	Rows           []IOStatRow `json:"rows,omitempty"`  // per backend_type × object × context, only rows with activity in the window
+}
+
+// IOMinReadsForLatency is how many physical reads a window needs before its
+// mean read latency means anything; a handful of cold reads gives a noise mean.
+const IOMinReadsForLatency = 500
+
+// IODeviceReadMS separates the two places a shared_buffers miss is served from:
+// the kernel page cache answers in microseconds, a device (or a network
+// volume's latency floor) in a millisecond or more.
+const IODeviceReadMS = 1.0
+
+// JudgedReadLatency is the window's mean read latency when it can be trusted:
+// a sampled section, track_io_timing on, and at least IOMinReadsForLatency reads.
+func (s *IOStats) JudgedReadLatency() (ms float64, ok bool) {
+	if s == nil || s.Exactness != ExactnessSampled || !s.TrackIOTiming || s.ReadLatencyMS == nil || s.ReadsInWindow < IOMinReadsForLatency {
+		return 0, false
+	}
+	return *s.ReadLatencyMS, true
 }
 
 // IOStatRow is one pg_stat_io row's activity over the sample window.

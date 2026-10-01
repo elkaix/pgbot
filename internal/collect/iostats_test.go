@@ -41,6 +41,28 @@ func TestIOStats_assembleRatesAndLatency(t *testing.T) {
 		t.Errorf("without track_io_timing: rates yes, latency nil, got %+v", c.IOStats)
 	}
 
+	// PG18 wal rows: counted, but zero-timed under track_io_timing alone, so
+	// they count toward the rates and stay out of the latency mean.
+	wal := func(writes int64) ioStatRow {
+		return ioStatRow{BackendType: "client backend", Object: "wal", Context: "normal", Reads: writes, Writes: writes}
+	}
+	a = ioStatsReading{rows: []ioStatRow{row(1000, 500, 10), wal(0)}, ioTiming: true}
+	b = ioStatsReading{rows: []ioStatRow{row(3000, 1500, 30), wal(8000)}, ioTiming: true}
+	c = &model.Context{}
+	iostatsCollector{}.Assemble(c, caps, sampled{A: a, B: b}, 10*time.Second, Options{})
+	if io := c.IOStats; io.ReadLatencyMS == nil || *io.ReadLatencyMS != 0.5 || io.ReadsInWindow != 2000 || *io.WritesPerSec != 802 {
+		t.Errorf("wal rows must count in rates but not latency, got %+v", io)
+	}
+
+	// track_io_timing turned on mid-window → read_time covers only part of the
+	// reads, so no latency rather than an understated one.
+	a.ioTiming, b.ioTiming = false, true
+	c = &model.Context{}
+	iostatsCollector{}.Assemble(c, caps, sampled{A: a, B: b}, 10*time.Second, Options{})
+	if c.IOStats.TrackIOTiming || c.IOStats.ReadLatencyMS != nil {
+		t.Errorf("timing toggled mid-window must not report latency, got %+v", c.IOStats)
+	}
+
 	// Counter reset → exactness reset, no rates.
 	c = &model.Context{}
 	iostatsCollector{}.Assemble(c, caps, sampled{A: b, B: a}, 10*time.Second, Options{})
